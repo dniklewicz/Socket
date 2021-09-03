@@ -134,7 +134,7 @@ public class Socket {
     }
     
     private func log(_ message: String, level: OSLogType = .default) {
-        if #available(OSX 11.0, *) {
+        if #available(OSX 11.0, iOS 14.0, *) {
             let logger = Logger(subsystem: "com.dniklewicz.UPSMonitor", category: "Socket")
             logger.log(level: level, "\(message)")
         } else {
