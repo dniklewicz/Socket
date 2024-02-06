@@ -12,15 +12,22 @@ import OSLog
 
 public enum SocketError: Error {
     case timeout
+	case cancelled
 }
 
 public class Socket {
     public let host: NWEndpoint.Host
     public let port: NWEndpoint.Port
-    public let parameters = NWParameters.tcp
-    
-    public var timeout: TimeInterval = 4
-    private var timeoutTimer: Timer? = nil
+	public let parameters: NWParameters = {
+		let options = NWProtocolTCP.Options()
+		options.connectionTimeout = 5
+		let parameters = NWParameters(tls: nil, tcp: options)
+		if let isOption = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+			isOption.version = .v4
+		}
+		parameters.preferNoProxies = true
+		return parameters
+	}()
     
     public var connection: NWConnection?
     let myQueue = DispatchQueue(label: NSUUID().uuidString)
@@ -34,7 +41,6 @@ public class Socket {
     }
     
     func complete(result: Result<Data, Error>) {
-        timeoutTimer?.invalidate()
         completionHandler?(result)
         completionHandler = nil
     }
@@ -44,12 +50,6 @@ public class Socket {
     }
     
     public func send(message: String, completion: @escaping ((Result<Data, Error>) -> Void)) {
-        timeoutTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] (timer) in
-            self?.complete(result: .failure(SocketError.timeout))
-            self?.cancel()
-            self?.log("Connection timeout")
-        }
-        
         self.completionHandler = completion
         if connection == nil {
             connection = create()
@@ -112,19 +112,20 @@ public class Socket {
             if let content = content {
                 self?.receivedData?.append(content)
             }
-            if isComplete || content == nil {
-                self?.complete(result: .success(self?.receivedData ?? Data()))
-                self?.cancel()
-            } else if let data = self?.receivedData,
-                let message = self?.message,
-                let string = String(data: data, encoding: .utf8),
-                string.lowercased().contains("end \(message.lowercased())") {
-                self?.complete(result: .success(self?.receivedData ?? Data()))
-                self?.cancel()
-            } else if self?.connection?.state == .ready && isComplete == false {
-                self?.receive()
-            }
-            
+			if isComplete || content == nil {
+				self?.complete(result: .success(self?.receivedData ?? Data()))
+				self?.cancel()
+			} else if let data = self?.receivedData,
+					  let message = self?.message,
+					  let string = String(data: data, encoding: .utf8),
+					  (string.localizedCaseInsensitiveContains("end \(message)")
+					   || string.localizedCaseInsensitiveContains("err")) {
+				self?.complete(result: .success(self?.receivedData ?? Data()))
+				self?.cancel()
+			} else if self?.connection?.state == .ready && isComplete == false {
+				self?.receive()
+			}
+			
         }
     }
     
