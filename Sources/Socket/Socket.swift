@@ -52,7 +52,7 @@ public actor Socket {
         }
         connection?.stateUpdateHandler = { [weak self] (newState) in
 			Task {
-				await self?.handleStateUpdate(newState)
+				await self?.handleStateUpdate(newState, message: message)
 			}
         }
         self.connection?.start(queue: self.myQueue)
@@ -69,7 +69,7 @@ public actor Socket {
     }
 	
 	// Handle connection state updates
-	private func handleStateUpdate(_ newState: NWConnection.State) async {
+	private func handleStateUpdate(_ newState: NWConnection.State, message: String) async {
 		switch (newState) {
 		case .ready:
 			log("Connection ready", level: .debug)
