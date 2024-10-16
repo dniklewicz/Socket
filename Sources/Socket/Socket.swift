@@ -57,15 +57,15 @@ public actor Socket {
         }
         self.connection?.start(queue: self.myQueue)
 
-//        connection?.betterPathUpdateHandler = { [weak self] (betterPathAvailable) in
-//			Task {
-//				if (betterPathAvailable) {
-//					await self?.log("Connection: Better path available")
-//					await self?.cancel()
-//					await self?.resetConnection()
-//				}
-//			}
-//        }
+        connection?.betterPathUpdateHandler = { [weak self] (betterPathAvailable) in
+			Task {
+				if (betterPathAvailable) {
+					await self?.log("Connection: Better path available")
+					await self?.cancel()
+					await self?.resetConnection()
+				}
+			}
+        }
     }
 	
 	// Handle connection state updates
@@ -76,7 +76,9 @@ public actor Socket {
 			sendMsg(message: message)
 			receive()
 		case .waiting(let error):
+			complete(result: .failure(error))
 			log("Connection waiting with error: \(error.localizedDescription)", level: .error)
+			cancel()
 		case .failed(let error):
 			complete(result: .failure(error))
 			log("Connection failed with error: \(error.localizedDescription)", level: .error)
