@@ -12,146 +12,250 @@ import OSLog
 
 public enum SocketError: Error {
     case timeout
-	case cancelled
+    case cancelled
+    case connectionFailed(Error)
+    case invalidState
+}
+
+public struct SocketConfiguration: Sendable {
+    public let connectionTimeout: Int
+    public let receiveBufferSize: Int
+    public let terminationPatterns: [String]
+    
+    public init(
+        connectionTimeout: Int = 5,
+        receiveBufferSize: Int = 8192,
+        terminationPatterns: [String] = ["end", "err"]
+    ) {
+        self.connectionTimeout = connectionTimeout
+        self.receiveBufferSize = receiveBufferSize
+        self.terminationPatterns = terminationPatterns
+    }
 }
 
 public actor Socket {
-    public let host: NWEndpoint.Host
-    public let port: NWEndpoint.Port
-	public let parameters: NWParameters = {
-		let options = NWProtocolTCP.Options()
-		options.connectionTimeout = 5
-		let parameters = NWParameters(tls: nil, tcp: options)
-		if let isOption = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
-			isOption.version = .v4
-		}
-		parameters.preferNoProxies = true
-		return parameters
-	}()
+    nonisolated public let host: NWEndpoint.Host
+    nonisolated public let port: NWEndpoint.Port
+    nonisolated public let configuration: SocketConfiguration
     
-    public var connection: NWConnection?
-    let myQueue = DispatchQueue(label: NSUUID().uuidString)
+    nonisolated public let parameters: NWParameters
     
-    public init(host: String, port: Int) {
+    private var connection: NWConnection?
+    private let myQueue = DispatchQueue(label: "Socket-\(UUID().uuidString)")
+    
+    private var continuation: CheckedContinuation<Data, Error>?
+    private var isOperationInProgress = false
+    
+    private var receivedData: Data?
+    private var currentMessage = ""
+    
+    public init(host: String, port: Int, configuration: SocketConfiguration = SocketConfiguration()) {
         self.host = NWEndpoint.Host(host)
         self.port = NWEndpoint.Port(integerLiteral: NWEndpoint.Port.IntegerLiteralType(port))
+        self.configuration = configuration
+        
+        let options = NWProtocolTCP.Options()
+        options.connectionTimeout = configuration.connectionTimeout
+        self.parameters = NWParameters(tls: nil, tcp: options)
+        
+        if let ipOption = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ipOption.version = .v4
+        }
+        parameters.preferNoProxies = true
         parameters.expiredDNSBehavior = .allow
         
-		connection = NWConnection(host: self.host, port: self.port, using: parameters)
+        // Initialize connection directly in init since we can't call actor methods
+        self.connection = NWConnection(host: self.host, port: self.port, using: parameters)
     }
     
-    func complete(result: Result<Data, Error>) {
-        completionHandler?(result)
-        completionHandler = nil
+    private func complete(result: Result<Data, Error>) {
+        guard let continuation = self.continuation else { return }
+        self.continuation = nil
+        self.isOperationInProgress = false
+        continuation.resume(with: result)
     }
     
-    public func send(message: String, completion: @escaping ((Result<Data, Error>) -> Void)) {
-        self.completionHandler = completion
-        if connection == nil {
-			resetConnection()
+    private func resetState() {
+        receivedData = nil
+        currentMessage = ""
+        continuation = nil
+        isOperationInProgress = false
+    }
+    
+    private func performSendTask(message: String) async throws -> Data {
+        guard !isOperationInProgress else {
+            throw SocketError.invalidState
         }
-        connection?.stateUpdateHandler = { [weak self] (newState) in
-			Task {
-				await self?.handleStateUpdate(newState, message: message)
-			}
+        
+        guard let connection = self.connection else {
+            throw SocketError.invalidState
         }
-        self.connection?.start(queue: self.myQueue)
-
-        connection?.betterPathUpdateHandler = { [weak self] (betterPathAvailable) in
-			Task {
-				if (betterPathAvailable) {
-					await self?.log("Connection: Better path available")
-					await self?.cancel()
-					await self?.resetConnection()
-				}
-			}
+        
+        isOperationInProgress = true
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            
+            connection.stateUpdateHandler = { [weak self] newState in
+                Task {
+                    await self?.handleStateUpdate(newState, message: message)
+                }
+            }
+            
+            connection.start(queue: self.myQueue)
         }
     }
-	
-	// Handle connection state updates
-	private func handleStateUpdate(_ newState: NWConnection.State, message: String) async {
-		switch (newState) {
-		case .ready:
-			log("Connection ready", level: .debug)
-			sendMsg(message: message)
-			receive()
-		case .waiting(let error):
-			complete(result: .failure(error))
-			log("Connection waiting with error: \(error.localizedDescription)", level: .error)
-			cancel()
-		case .failed(let error):
-			complete(result: .failure(error))
-			log("Connection failed with error: \(error.localizedDescription)", level: .error)
-			cancel()
-		case .cancelled:
-			log("Connection cancelled")
-		default:
-			break
-		}
-	}
-	
-	func resetConnection() {
-		self.connection = NWConnection(host: host, port: port, using: parameters)
-	}
     
-    private var completionHandler: ((Result<Data, Error>) -> Void)?
-    private var receivedData: Data?
-    private var message = ""
+    public func send(message: String, timeout: Duration = .seconds(5)) async throws -> Data {
+        if connection?.state == .cancelled || connection == nil {
+            resetConnection()
+        }
+        
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask {
+                try await self.performSendTask(message: message)
+            }
+            
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                await self.handleTimeout()
+                throw SocketError.timeout
+            }
+            
+            defer { group.cancelAll() }
+            
+            guard let result = try await group.next() else {
+                throw SocketError.timeout
+            }
+            
+            return result
+        }
+    }
+    
+    private func handleTimeout() {
+        complete(result: .failure(SocketError.timeout))
+        cancelConnectionOnly()
+    }
+    
+    // Handle connection state updates
+    private func handleStateUpdate(_ newState: NWConnection.State, message: String) {
+        switch newState {
+        case .ready:
+            log("Connection ready", level: .debug)
+            sendMsg(message: message)
+            receive()
+        case .waiting(let error):
+            complete(result: .failure(SocketError.connectionFailed(error)))
+            log("Connection waiting with error: \(error.localizedDescription)", level: .error)
+            cancelConnectionOnly()
+        case .failed(let error):
+            complete(result: .failure(SocketError.connectionFailed(error)))
+            log("Connection failed with error: \(error.localizedDescription)", level: .error)
+            cancelConnectionOnly()
+        case .cancelled:
+            complete(result: .failure(SocketError.cancelled))
+            log("Connection cancelled")
+            cancelConnectionOnly()
+        default:
+            break
+        }
+    }
+    
+    private func resetConnection() {
+        cancelConnectionOnly()
+        resetState()
+        connection = NWConnection(host: host, port: port, using: parameters)
+    }
     
     private func sendMsg(message: String) {
         self.receivedData = Data()
-        self.message = message
+        self.currentMessage = message
         let msg = message + "\r\n"
-        let data: Data? = msg.data(using: .utf8)
-        connection?.send(content: data, completion: .contentProcessed { [weak self] (sendError) in
-            if let sendError = sendError {
-				Task {
-					await self?.log("Connection sending error: \(sendError)", level: .error)
-				}
+        
+        guard let data = msg.data(using: .utf8) else {
+            complete(result: .failure(SocketError.invalidState))
+            return
+        }
+        
+        connection?.send(content: data, completion: .contentProcessed { [weak self] error in
+            if let error = error {
+                Task {
+                    await self?.log("Connection sending error: \(error)", level: .error)
+                    await self?.complete(result: .failure(SocketError.connectionFailed(error)))
+                    await self?.cancelConnectionOnly()
+                }
             }
         })
     }
-	
-	private func appendReceivedData(_ data: Data) {
-		receivedData?.append(data)
-	}
+    
+    private func appendReceivedData(_ data: Data) {
+        if receivedData == nil {
+            receivedData = Data()
+        }
+        receivedData?.append(data)
+    }
     
     private func receive() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] (content, context, isComplete, error) in
-			Task {
-				if let error {
-					await self?.complete(result: .failure(error))
-					await self?.cancel()
-					return
-				}
-				
-				if let content {
-					await self?.appendReceivedData(content)
-				}
-				if isComplete || content == nil {
-					await self?.complete(result: .success(self?.receivedData ?? Data()))
-					await self?.cancel()
-				} else if let data = await self?.receivedData,
-						  let message = await self?.message,
-						  let string = String(data: data, encoding: .utf8),
-						  (string.localizedCaseInsensitiveContains("end \(message)")
-						   || string.localizedCaseInsensitiveContains("err")) {
-					await self?.complete(result: .success(self?.receivedData ?? Data()))
-					await self?.cancel()
-				} else if await self?.connection?.state == .ready && isComplete == false {
-					await self?.receive()
-				}
-			}
+        connection?.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: configuration.receiveBufferSize
+        ) { [weak self] (content, context, isComplete, error) in
+            Task {
+                guard let self = self else { return }
+                
+                if let error = error {
+                    await self.complete(result: .failure(SocketError.connectionFailed(error)))
+                    await self.cancel()
+                    return
+                }
+                
+                if let content = content {
+                    await self.appendReceivedData(content)
+                }
+                
+                if isComplete || content == nil {
+                    await self.complete(result: .success(self.receivedData ?? Data()))
+                    await self.cancel()
+                } else if await self.shouldTerminateReceive() {
+                    await self.complete(result: .success(self.receivedData ?? Data()))
+                    await self.cancel()
+                } else if await self.connection?.state == .ready {
+                    await self.receive()
+                }
+            }
         }
     }
     
-    public func cancel() {
+    private func shouldTerminateReceive() -> Bool {
+        guard let data = receivedData,
+              let string = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        
+        let lowercaseString = string.lowercased()
+        let lowercaseMessage = currentMessage.lowercased()
+        
+        return configuration.terminationPatterns.contains { pattern in
+            lowercaseString.contains("\(pattern) \(lowercaseMessage)") ||
+            lowercaseString.contains(pattern.lowercased())
+        }
+    }
+    
+    // Only shuts down the NWConnection. Does NOT call `complete(...)`
+    private func cancelConnectionOnly() {
         connection?.cancel()
         connection = nil
     }
     
+    public func cancel() {
+        // if a send is in flight, signal cancellation
+        complete(result: .failure(SocketError.cancelled))
+        cancelConnectionOnly()
+        resetState()
+    }
+    
     private func log(_ message: String, level: OSLogType = .default) {
-		let logger = Logger(subsystem: "Socket", category: "Socket")
-		logger.log(level: level, "\(message)")
+        let logger = Logger(subsystem: "Socket", category: "Socket")
+        logger.log(level: level, "\(message)")
     }
 }

@@ -5,7 +5,7 @@ import PackageDescription
 
 let package = Package(
     name: "Socket",
-	platforms: [.macOS(.v11), .iOS(.v14)],
+	platforms: [.macOS(.v13), .iOS(.v16)],
     products: [
         // Products define the executables and libraries a package produces, and make them visible to other packages.
         .library(
