@@ -145,9 +145,9 @@ public actor Socket {
             sendMsg(message: message)
             receive()
         case .waiting(let error):
-            complete(result: .failure(SocketError.connectionFailed(error)))
+//            complete(result: .failure(SocketError.connectionFailed(error)))
             log("Connection waiting with error: \(error.localizedDescription)", level: .error)
-            cancelConnectionOnly()
+//            cancelConnectionOnly()
         case .failed(let error):
             complete(result: .failure(SocketError.connectionFailed(error)))
             log("Connection failed with error: \(error.localizedDescription)", level: .error)
