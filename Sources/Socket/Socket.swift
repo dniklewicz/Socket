@@ -10,11 +10,24 @@ import Foundation
 import Network
 import OSLog
 
-public enum SocketError: Error {
+public enum SocketError: LocalizedError {
     case timeout
     case cancelled
     case connectionFailed(Error)
     case invalidState
+	
+	public var errorDescription: String? {
+		switch self {
+		case .timeout:
+			return "Cannot connect to host within the specified timeout"
+		case .cancelled:
+			return "Connection was cancelled"
+		case .connectionFailed(let error):
+			return "Connection failed:\n\(error.localizedDescription)"
+		case .invalidState:
+			return "Invalid socket state"
+		}
+	}
 }
 
 public struct SocketConfiguration: Sendable {
