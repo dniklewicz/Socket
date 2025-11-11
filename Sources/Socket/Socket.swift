@@ -250,7 +250,9 @@ public actor Socket {
         
         return configuration.terminationPatterns.contains { pattern in
             lowercaseString.contains("\(pattern) \(lowercaseMessage)") ||
-            lowercaseString.contains(pattern.lowercased())
+            lowercaseString.starts(with: "err ") ||
+			lowercaseString.contains("\nerr ") ||
+			lowercaseString.contains("\nend ")
         }
     }
     
